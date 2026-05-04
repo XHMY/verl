@@ -148,7 +148,7 @@ class vLLMRollout(BaseRollout):
             lora_rank = model_config.lora_rank
 
         self.lora_kwargs = (
-            {"enable_lora": True, "max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(lora_rank)}
+            {"enable_lora": True, "max_loras": config.max_loras, "max_lora_rank": get_vllm_max_lora_rank(lora_rank)}
             if model_config.lora_rank > 0
             else {}
         )
@@ -525,11 +525,15 @@ class vLLMAsyncRollout(BaseRollout):
         self.tokenizer = self.model_config.tokenizer
         self.inference_engine: WorkerWrapperBase = None
         self.address = self._init_zeromq()
-        self.lora_config = (
-            {"max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank)}
-            if self.model_config.lora_rank > 0
-            else {}
-        )
+        if self.model_config.lora_rank > 0:
+            # Support multi-agent LoRA: set max_loras based on agent_names config
+            # max_loras = getattr(self.model_config, "max_loras", 1)
+            self.lora_config = {
+                "max_loras": self.config.max_loras,
+                "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank),
+            }
+        else:
+            self.lora_config = {}
 
         if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
             logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
@@ -624,25 +628,36 @@ class vLLMAsyncRollout(BaseRollout):
         if self.config.free_cache_engine:
             self.inference_engine.sleep(level=self.sleep_level)
 
-    async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
+    async def update_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        lora_int_id: int = None,
+        **kwargs,
+    ):
         """Update the weights of the rollout model.
 
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
+            lora_int_id: The integer ID for this LoRA adapter (for multi-agent support).
+                         If None, uses VLLM_LORA_INT_ID for backward compatibility.
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
+            # Determine the lora_int_id to use (multi-agent support)
+            effective_lora_int_id = lora_int_id if lora_int_id is not None else VLLM_LORA_INT_ID
+            effective_lora_name = f"{effective_lora_int_id}"
+
             # In async mode, make sure the old lora is removed before adding the new one
-            self.inference_engine.worker.remove_lora(VLLM_LORA_INT_ID)
+            self.inference_engine.worker.remove_lora(effective_lora_int_id)
             lora_request = TensorLoRARequest(
-                lora_name=VLLM_LORA_NAME,
-                lora_int_id=VLLM_LORA_INT_ID,
+                lora_name=effective_lora_name,
+                lora_int_id=effective_lora_int_id,
                 lora_path=VLLM_LORA_PATH,
                 peft_config=asdict(peft_config),
                 lora_tensors=dict(weights),
             )
             self.inference_engine.worker.add_lora(lora_request)
-            logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+            logger.info(f"vLLM load weights for lora_int_id={effective_lora_int_id}, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 

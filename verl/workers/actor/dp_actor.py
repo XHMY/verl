@@ -91,6 +91,11 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
+        # I6 (gradient-direction coherence regularizer): per-role EMA of accumulated grad shards,
+        # keyed as {role: {param_name: ema_tensor}}. Lazy init in _apply_coherence_regularizer.
+        # Persisted per-rank via save/load_coherence_ema_state (called from the FSDP worker).
+        self._coherence_ema: dict[str, dict[str, torch.Tensor]] = {}
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -306,6 +311,156 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_optimizer.step()
         return grad_norm
 
+    def _apply_coherence_regularizer(
+        self,
+        role: str,
+        weight: float,
+        ema_window: int,
+        eps: float,
+        metrics: dict,
+    ):
+        """I6 — Gradient-direction coherence regularizer (step-scaling form).
+
+        After mini-batch backward accumulation completes, scale each parameter's grad
+        shard by `(1 - weight * max(0, cos(g, ḡ)))`, where ḡ is an EMA of past grads
+        for `role`. Then update the EMA in place using the post-surgery grad. Only the
+        currently-active LoRA adapter has `requires_grad=True`, so the parameter loop
+        is implicitly role-scoped.
+
+        Args:
+            role: agent name; used as the EMA dict key.
+            weight: λ in `1 - λ·max(0, cos)`. 0 short-circuits.
+            ema_window: τ = 1 - 1/window (e.g., 128 → τ ≈ 0.992).
+            eps: numerical floor on the cosine denominator.
+            metrics: dict to populate with `actor/coherence_{cos,scale,ema_norm}`.
+        """
+        if weight <= 0.0:
+            return
+
+        ema_role = self._coherence_ema.setdefault(role, {})
+
+        # Pass 1 — collect (param_name, g_local, ema_local) and accumulate dot products.
+        # Use float32 accumulators to avoid bf16 underflow.
+        device = None
+        gg = torch.zeros((), dtype=torch.float32)
+        ee = torch.zeros((), dtype=torch.float32)
+        ge = torch.zeros((), dtype=torch.float32)
+        targets = []
+        for name, p in self.actor_module.named_parameters():
+            if not p.requires_grad or p.grad is None:
+                continue
+            grad = p.grad
+            if isinstance(grad, DTensor):
+                g_local = grad.to_local()
+            else:
+                g_local = grad
+            if g_local.numel() == 0:
+                continue
+            if device is None:
+                device = g_local.device
+                gg = gg.to(device)
+                ee = ee.to(device)
+                ge = ge.to(device)
+            ema_local = ema_role.get(name)
+            if ema_local is None:
+                ema_local = g_local.detach().clone()
+                ema_role[name] = ema_local
+            g_f32 = g_local.to(torch.float32)
+            e_f32 = ema_local.to(torch.float32)
+            gg += g_f32.pow(2).sum()
+            ee += e_f32.pow(2).sum()
+            ge += (g_f32 * e_f32).sum()
+            targets.append((g_local, ema_local))
+
+        if not targets:
+            return
+
+        # All-reduce SUM on the 3 scalars across world (trivial cost — 12 bytes per scalar).
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            stacked = torch.stack([gg, ee, ge])
+            torch.distributed.all_reduce(stacked, op=torch.distributed.ReduceOp.SUM)
+            gg, ee, ge = stacked[0], stacked[1], stacked[2]
+
+        cos = ge / (gg.sqrt() * ee.sqrt() + eps)
+        cos_clamped = cos.clamp(0.0, 1.0)
+        scale = 1.0 - float(weight) * cos_clamped  # scalar tensor on device
+
+        scale_val = scale.to(torch.float32)
+        tau = 1.0 - 1.0 / float(max(ema_window, 1))
+
+        # Pass 2 — apply surgery in-place, then update EMA toward post-surgery grad.
+        for g_local, ema_local in targets:
+            g_local.mul_(scale_val.to(g_local.dtype))
+            ema_local.mul_(tau).add_(g_local.to(ema_local.dtype), alpha=1.0 - tau)
+
+        metrics["actor/coherence_cos"] = float(cos.detach().item())
+        metrics["actor/coherence_scale"] = float(scale.detach().item())
+        metrics["actor/coherence_ema_norm"] = float(ee.detach().sqrt().item())
+
+    def save_coherence_ema_state(self, path: str) -> None:
+        """Serialize the per-rank I6 EMA shards to `path` (one file per rank).
+
+        Layout: torch.save({"world_size": int, "rank": int, "ema": {role: {name: cpu_tensor}}}).
+        EMA shards live alongside FSDP-sharded gradients, so reloading is only valid
+        when the world size matches; otherwise load_coherence_ema_state cold-starts.
+        Skips the write entirely when the EMA dict is empty (e.g. roles with weight=0).
+        """
+        if not self._coherence_ema:
+            return
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else 0
+        )
+        cpu_ema = {
+            role: {name: tensor.detach().to("cpu") for name, tensor in role_ema.items()}
+            for role, role_ema in self._coherence_ema.items()
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({"world_size": world_size, "rank": rank, "ema": cpu_ema}, path)
+
+    def load_coherence_ema_state(self, path: str) -> bool:
+        """Reload per-rank EMA shards from `path` if shape/world conventions match.
+
+        Returns True on a successful load. Returns False (and leaves `_coherence_ema`
+        as the cold-start empty dict) when the file is absent or the saved world size
+        differs from the current world size — at that point the regularizer simply
+        re-initializes lazily on the next step, the same as a fresh run.
+        """
+        if not os.path.exists(path):
+            return False
+        try:
+            blob = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            logger.warning(f"[I6] failed to load coherence EMA from {path}: {exc}")
+            return False
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        if int(blob.get("world_size", -1)) != world_size:
+            logger.warning(
+                f"[I6] coherence EMA world_size mismatch (file={blob.get('world_size')}, "
+                f"current={world_size}); cold-starting EMA"
+            )
+            return False
+        ema_blob = blob.get("ema", {}) or {}
+        device = next(
+            (p.device for p in self.actor_module.parameters() if p.requires_grad),
+            torch.device("cpu"),
+        )
+        self._coherence_ema = {
+            role: {name: tensor.to(device) for name, tensor in role_ema.items()}
+            for role, role_ema in ema_blob.items()
+        }
+        return True
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
@@ -505,9 +660,13 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        # Per-role KL coefficient override (I1 intervention).
+                        # Trainer sets `kl_loss_coef_override` on sub_batch.meta_info per agent for IP runs;
+                        # falls through to global `kl_loss_coef` otherwise.
+                        kl_coef = float(data.meta_info.get("kl_loss_coef_override", self.config.kl_loss_coef))
+                        policy_loss = policy_loss + kl_loss * kl_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
-                        micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                        micro_batch_metrics["actor/kl_coef"] = kl_coef
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
@@ -521,6 +680,20 @@ class DataParallelPPOActor(BasePPOActor):
 
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
+
+                # I6 — gradient-direction coherence regularizer. Surgery on the active
+                # adapter's accumulated grads, before clip + step. Trainer sets
+                # `coherence_reg_*` on data.meta_info per agent under IP runs.
+                if data.meta_info.get("coherence_reg_weight", 0.0) > 0:
+                    coh_metrics: dict = {}
+                    self._apply_coherence_regularizer(
+                        role=str(data.meta_info["coherence_reg_role"]),
+                        weight=float(data.meta_info["coherence_reg_weight"]),
+                        ema_window=int(data.meta_info.get("coherence_reg_ema_window", 128)),
+                        eps=float(data.meta_info.get("coherence_reg_eps", 1e-8)),
+                        metrics=coh_metrics,
+                    )
+                    append_to_dict(metrics, coh_metrics)
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}

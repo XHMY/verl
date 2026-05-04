@@ -202,7 +202,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             peft_config = None
             peft_model = getattr(self.module, "_fsdp_wrapped_module", self.module)
             if hasattr(peft_model, "peft_config"):
-                peft_config = peft_model.peft_config.get("default", None)
+                # Support multi-agent LoRA: get first available adapter config instead of hardcoded "default"
+                peft_config = list(peft_model.peft_config.values())[0] if peft_model.peft_config else None
                 params = __collect_lora_params()
             else:
                 params = self.module.state_dict()

@@ -159,6 +159,7 @@ class RolloutConfig(BaseConfig):
 
     multi_stage_wake_up: bool = False
     engine_kwargs: dict = field(default_factory=dict)
+    max_loras: int = 1
 
     calculate_log_probs: bool = False
 

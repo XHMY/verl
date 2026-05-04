@@ -16,6 +16,7 @@ import heapq
 import logging
 import os
 import random
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
@@ -76,15 +77,31 @@ class AsyncLLMServerManager:
         self.request_id_to_server = LRUCache(maxsize=max_cache_size)
 
     def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
-        # TODO: implement server pressure awareness load balancing
+        # Sticky session: return the same server for the same request_id (prefix caching)
         if request_id in self.request_id_to_server:
-            return self.request_id_to_server[request_id]
+            server = self.request_id_to_server[request_id]
+            # Increment active count for sticky session hit too
+            for entry in self.weighted_serveres:
+                if entry[1][1] is server:
+                    entry[0] += 1
+                    break
+            heapq.heapify(self.weighted_serveres)
+            return server
 
+        # Least-active-requests load balancing: pick server with fewest in-flight requests
         server = self.weighted_serveres[0][1][1]
         self.weighted_serveres[0][0] += 1
         heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
         self.request_id_to_server[request_id] = server
         return server
+
+    def _release_server(self, server: ray.actor.ActorHandle):
+        """Decrement active request count for a server after request completes."""
+        for entry in self.weighted_serveres:
+            if entry[1][1] is server:
+                entry[0] -= 1
+                break
+        heapq.heapify(self.weighted_serveres)
 
     @rollout_trace_op
     async def generate(
@@ -94,6 +111,7 @@ class AsyncLLMServerManager:
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
+        lora_int_id: Optional[int] = None,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
@@ -106,13 +124,21 @@ class AsyncLLMServerManager:
             TokenOutput: token output
         """
         server = self._choose_server(request_id)
-        output = await server.generate.remote(
-            request_id=request_id,
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-            image_data=image_data,
-        )
-        return output
+        # Use request_id for sticky session routing but generate a unique ID
+        # for vLLM to avoid "Request id already running" when workflows make
+        # concurrent calls with the same application_id (e.g., parallel workers).
+        vllm_request_id = f"{request_id}_{uuid.uuid4().hex[:8]}"
+        try:
+            output = await server.generate.remote(
+                request_id=vllm_request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                lora_int_id=lora_int_id,
+            )
+            return output
+        finally:
+            self._release_server(server)
 
 
 class AgentLoopMetrics(BaseModel):
@@ -816,3 +842,17 @@ class AgentLoopManager:
             await asyncio.gather(*tasks)
 
         asyncio.run(run_all())
+
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        """Load LoRA adapter to all rollout server instances.
+
+        Args:
+            lora_name (str): LoRA adapter name.
+            lora_path (str): LoRA adapter path.
+        """
+        ray.get(
+            [
+                replica.load_lora_adapter.remote(lora_name=lora_name, lora_path=lora_path)
+                for replica in self.rollout_replicas
+            ]
+        )

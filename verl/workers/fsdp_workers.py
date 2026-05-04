@@ -36,6 +36,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 
+from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID
+
 try:
     # for torch 2.5+
     from torch.distributed.tensor import DTensor
@@ -438,6 +440,43 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
 
+                # Check if multi-agent mode is enabled
+                multi_agent_names = self.config.get("agent_names", [])
+                if len(multi_agent_names) >= 1 and (not self.config.get("share_policy")):
+                    # Multi-agent: Initialize all LoRA adapters before FSDP wrapping
+                    if self.rank == 0:
+                        print(f"[Multi-Agent LoRA] Initializing {len(multi_agent_names)} adapters: {multi_agent_names}")
+
+                    initial_lora_adapters = self.config.get("initial_lora_adapters", {})
+
+                    for adapter_name in multi_agent_names:
+                        if adapter_name != "default":
+                            adapter_path = initial_lora_adapters.get(adapter_name) if initial_lora_adapters else None
+                            if adapter_path:
+                                # Load pre-trained adapter weights
+                                local_adapter_path = copy_to_local(adapter_path, use_shm=self.config.model.get("use_shm", False))
+                                actor_module.load_adapter(local_adapter_path, adapter_name=adapter_name, is_trainable=True)
+                                if isinstance(actor_module.peft_config[adapter_name].task_type, str):
+                                    actor_module.peft_config[adapter_name].task_type = TaskType.CAUSAL_LM
+                                if self.rank == 0:
+                                    print(f"[Multi-Agent LoRA] Loaded pre-trained adapter '{adapter_name}' from: {adapter_path}")
+                            else:
+                                # Fresh random init
+                                actor_module.add_adapter(adapter_name=adapter_name, peft_config=LoraConfig(**lora_config))
+                                if self.rank == 0:
+                                    print(f"[Multi-Agent LoRA] Added fresh adapter: {adapter_name}")
+
+                    # FSDP auto wrapping requires all parameters to have requires_grad set correctly
+                    for name, param in actor_module.named_parameters():
+                        if "lora" in name and "default" not in name:
+                            param.requires_grad = True
+                        else:
+                            param.requires_grad = False
+
+                    self.current_active_lora = multi_agent_names[0]
+                    if self.rank == 0:
+                        print(f"[Multi-Agent LoRA] All adapters initialized. Active adapter: {multi_agent_names[0]}")
+
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
             vision_tower = get_vl_model_vision_tower(actor_module)
@@ -657,8 +696,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
-        peft_config = None
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+
+        # Check for multi-agent LoRA mode
+        agent_names = self.config.get("agent_names", [])
+        is_multi_agent = (
+            hasattr(peft_model, "peft_config")
+            and len(agent_names) >= 1
+            and not self.config.get("share_policy", False)
+        )
+
+        if is_multi_agent:
+            # Multi-agent LoRA: sync ALL adapters with unique lora_int_ids
+            await self._sync_multi_agent_lora_weights(peft_model, agent_names)
+        else:
+            # Single-agent mode: original logic (backward compatible)
+            await self._sync_single_agent_weights(peft_model)
+
+        self.base_sync_done = True
+        # important: need to manually set the random states of each tp to be identical.
+        self.torch_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.gen_random_states)
+
+    async def _sync_single_agent_weights(self, peft_model):
+        """Original single-agent weight sync logic (backward compatible)."""
+        peft_config = None
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
             params = collect_lora_params(
@@ -726,10 +788,173 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await self.rollout.resume(tags=["kv_cache"])
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
-        self.base_sync_done = True
-        # important: need to manually set the random states of each tp to be identical.
-        self.torch_random_states = get_torch_device().get_rng_state()
-        get_torch_device().set_rng_state(self.gen_random_states)
+    def _compute_weight_hash(self, params: dict, name: str = "") -> dict:
+        """Compute MD5 hash and statistics for weight verification.
+
+        Args:
+            params: Dictionary of parameter name -> tensor
+            name: Name for logging purposes
+
+        Returns:
+            Dictionary with MD5 hash and basic statistics
+        """
+        import hashlib
+
+        if not params:
+            return {"name": name, "num_params": 0, "md5": "empty", "num_elements": 0}
+
+        md5_hash = hashlib.md5()
+        total_count = 0
+
+        # Sort keys for deterministic hash computation
+        for param_name in sorted(params.keys()):
+            param = params[param_name]
+            if isinstance(param, DTensor):
+                param = param.full_tensor()
+            # Convert to bytes in a deterministic way (use contiguous float32)
+            param_bytes = param.float().contiguous().cpu().numpy().tobytes()
+            md5_hash.update(param_bytes)
+            total_count += param.numel()
+
+        return {
+            "name": name,
+            "num_params": len(params),
+            "num_elements": total_count,
+            "md5": md5_hash.hexdigest(),
+        }
+
+    async def _sync_multi_agent_lora_weights(self, peft_model, agent_names: list):
+        """Sync LoRA weights for all agents in multi-agent mode.
+
+        Each agent's adapter is synced with a unique lora_int_id (index + 1),
+        matching the mapping used in verl_engine.py for inference routing.
+
+        Args:
+            peft_model: The PEFT model containing all agent adapters
+            agent_names: List of agent names (e.g., ["agent_0", "agent_1", "agent_2"])
+        """
+        if self.rank == 0:
+            logger.info(f"[Multi-Agent LoRA] Syncing {len(agent_names)} adapters: {agent_names}")
+            logger.info(f"[Multi-Agent LoRA] Available adapters in peft_config: {list(peft_model.peft_config.keys())}")
+            logger.info(f"[Multi-Agent LoRA] base_sync_done={self.base_sync_done}")
+
+        # Validate agent_names match available adapters
+        available_adapters = set(peft_model.peft_config.keys())
+        for name in agent_names:
+            if name not in available_adapters:
+                raise ValueError(
+                    f"[Multi-Agent LoRA] Adapter '{name}' not found in peft_config. "
+                    f"Available adapters: {available_adapters}"
+                )
+
+        # Get first adapter's peft_config (they should all have the same structure)
+        first_adapter_name = agent_names[0]
+        peft_config = peft_model.peft_config[first_adapter_name]
+
+        # Step 1: Collect ALL adapter weights FIRST while model is on GPU
+        # (Same pattern as single-agent: collect once, then sync)
+        all_adapter_params = {}
+        layered_summon = self.config.rollout.get("layered_summon", False)
+
+        for adapter_name in agent_names:
+            adapter_params = collect_lora_params(
+                module=self.actor_module_fsdp,
+                layered_summon=layered_summon,
+                base_sync_done=True,  # Only sync LoRA params, not base model
+                adapter_name=adapter_name,
+            )
+            adapter_params = convert_weight_keys(
+                adapter_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            )
+            all_adapter_params[adapter_name] = adapter_params
+
+            if self.rank == 0:
+                # Debug: log param shapes to verify correct collection
+                sample_key = next(iter(adapter_params.keys())) if adapter_params else None
+                sample_shape = adapter_params[sample_key].shape if sample_key else None
+                logger.info(
+                    f"[Multi-Agent LoRA] Collected adapter '{adapter_name}': "
+                    f"{len(adapter_params)} params, sample: {sample_key}={sample_shape}"
+                )
+                # Compute and log MD5 hash for weight verification
+                hash_info = self._compute_weight_hash(adapter_params, adapter_name)
+                logger.info(
+                    f"[Multi-Agent LoRA] Weight MD5 for '{adapter_name}': "
+                    f"md5={hash_info['md5']}, "
+                    f"num_params={hash_info['num_params']}, "
+                    f"num_elements={hash_info['num_elements']}"
+                )
+
+        # Step 2: Handle base model sync if needed
+        # - First time sync (base_sync_done=False), OR
+        # - sleep_level=2: base model weights are destroyed during each sleep cycle
+        sleep_level = getattr(self.rollout, "sleep_level", None)
+        need_base_sync = not self.base_sync_done or sleep_level == 2
+        if self.rank == 0 and need_base_sync:
+            reason = "first sync" if not self.base_sync_done else f"sleep_level={sleep_level}"
+            logger.info(f"[Multi-Agent LoRA] Base model sync needed: {reason}")
+        if need_base_sync:
+            base_model_params = collect_lora_params(
+                module=self.actor_module_fsdp,
+                layered_summon=layered_summon,
+                base_sync_done=False,
+                adapter_name=first_adapter_name,
+            )
+            base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
+            base_model_params = convert_weight_keys(
+                base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            )
+
+        # Step 3: Offload model to CPU (same as single-agent)
+        log_gpu_memory_usage("Before offload_fsdp_model_to_cpu (multi-agent)", logger=logger)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        log_gpu_memory_usage("After offload_fsdp_model_to_cpu (multi-agent)", logger=logger)
+
+        set_expandable_segments(False)
+
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["weights"])
+        log_gpu_memory_usage("After resume weights (multi-agent)", logger=logger)
+
+        # Step 4: Sync base model if needed (first sync or sleep_level=2)
+        if need_base_sync:
+            device = get_device_id()
+            per_tensor_base_params = (
+                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                for name, param in base_model_params.items()
+            )
+            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
+            del base_model_params, per_tensor_base_params
+            aggressive_empty_cache(force_sync=False)
+
+        # Step 5: Sync each agent's LoRA adapter with its unique lora_int_id
+        for idx, adapter_name in enumerate(agent_names):
+            lora_int_id = idx + VLLM_LORA_INT_ID  # Consistent mapping: agent_names.index(name) + VLLM_LORA_INT_ID
+            adapter_params = all_adapter_params[adapter_name]
+            adapter_peft_config = peft_model.peft_config[adapter_name]
+
+            per_tensor_params = adapter_params.items() if isinstance(adapter_params, dict) else adapter_params
+            await self.rollout.update_weights(
+                per_tensor_params,
+                peft_config=adapter_peft_config,
+                base_sync_done=True,
+                lora_int_id=lora_int_id,
+            )
+
+            if self.rank == 0:
+                logger.info(f"[Multi-Agent LoRA] Synced adapter '{adapter_name}' with lora_int_id={lora_int_id}")
+
+            del adapter_params
+            aggressive_empty_cache(force_sync=False)
+
+        del all_adapter_params
+        log_gpu_memory_usage("After update_weights (multi-agent)", logger=logger)
+        aggressive_empty_cache(force_sync=True)
+
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["kv_cache"])
+        log_gpu_memory_usage("After resume kv_cache (multi-agent)", logger=logger)
 
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
@@ -748,6 +973,110 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # restore random states
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_active_lora(self, agent_role: str, lora_config: dict = None):
+        """
+        Switch the active LoRA adapter for training.
+        Only the active adapter receives gradient updates.
+
+        Args:
+            agent_role: Name of the agent role (e.g., "generator_initial")
+            lora_config: LoRA configuration dict (unused, for API compatibility)
+        """
+        multi_agent_names = self.config.get("agent_names", None)
+        if not self._is_lora or not multi_agent_names or len(multi_agent_names) < 1:
+            return  # Not multi-agent LoRA mode
+
+        if not self._is_actor:
+            return  # Only actor worker needs to switch adapters
+
+        if self.rank == 0:
+            print(f"[Multi-Agent LoRA] Switching active adapter to: {agent_role}")
+
+        # Verify adapter exists (all adapters should be loaded during initialization)
+        if agent_role not in multi_agent_names:
+            raise ValueError(f"Adapter '{agent_role}' not found. Available adapters: {multi_agent_names}")
+
+        # Switch active adapter in PEFT model
+        peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        peft_model.set_adapter(agent_role)
+
+        # Update requires_grad for the new active adapter
+        for name, param in self.actor_module_fsdp.named_parameters():
+            if agent_role in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+        self.current_active_lora = agent_role
+        if self.rank == 0:
+            trainable_params = [(name, param.shape) for name, param in self.actor_module_fsdp.named_parameters() if param.requires_grad]
+            print(f"[Multi-Agent LoRA] Active adapter: {agent_role}, trainable params: {len(trainable_params)}")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_single_lora_adapter(self, agent_name: str, save_path: str, global_step: int = 0):
+        """
+        Save a single LoRA adapter for a specific agent.
+        Used in multi-agent training to save each adapter separately.
+
+        Args:
+            agent_name: Name of the agent whose adapter to save
+            save_path: Path to save the adapter
+            global_step: Current training step (for logging)
+        """
+        import json
+        import os
+
+        from safetensors.torch import save_file
+
+        from verl.utils.fsdp_utils import layered_summon_lora_params, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
+        from verl.utils.logger import log_with_rank
+
+        if not self._is_actor or not self._is_lora:
+            return
+
+        # Switch to the target adapter
+        self.set_active_lora(agent_name, {})
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        peft_config = {}
+
+        if dist.get_rank() == 0:
+            os.makedirs(save_path, exist_ok=True)
+            adapter_peft_config = peft_model.peft_config.get(agent_name, {})
+            if adapter_peft_config:
+                peft_config = asdict(adapter_peft_config)
+                peft_config["task_type"] = peft_config["task_type"].value
+                peft_config["peft_type"] = peft_config["peft_type"].value
+                peft_config["target_modules"] = list(peft_config["target_modules"])
+
+        try:
+            if fsdp_version(self.actor_module_fsdp) > 0:
+                self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
+                lora_params = layered_summon_lora_params(self.actor_module_fsdp, adapter_name=agent_name)
+                if dist.get_rank() == 0:
+                    save_file(lora_params, os.path.join(save_path, "adapter_model.safetensors"))
+                    with open(os.path.join(save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+                        json.dump(peft_config, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            log_with_rank(
+                f"Save LoRA Adapter Error for {agent_name} ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
+            )
+
+        dist.barrier()
+        log_with_rank(
+            f"[rank-{self.rank}]: Saved LoRA adapter '{agent_name}' to: {save_path}",
+            rank=dist.get_rank(),
+            logger=logger,
+            log_only_rank_0=True,
+        )
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -1076,6 +1405,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 log_only_rank_0=True,
             )
 
+        # I6 — persist per-rank coherence EMA shards alongside the actor checkpoint.
+        # No-op when I6 is disabled (the EMA dict stays empty).
+        if hasattr(self, "actor") and getattr(self.actor, "_coherence_ema", None):
+            ema_path = os.path.join(
+                local_path, "coherence_ema", f"rank{dist.get_rank()}.pt"
+            )
+            self.actor.save_coherence_ema_state(ema_path)
+            dist.barrier()
+
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
@@ -1100,6 +1438,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.checkpoint_manager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
+
+        # I6 — restore per-rank coherence EMA shards if present and world-compatible.
+        # Safe no-op for non-I6 runs and for runs that started before this feature.
+        if hasattr(self, "actor"):
+            ema_path = os.path.join(
+                local_path, "coherence_ema", f"rank{dist.get_rank()}.pt"
+            )
+            self.actor.load_coherence_ema_state(ema_path)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

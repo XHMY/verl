@@ -28,6 +28,7 @@ import torch
 from omegaconf import DictConfig, ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
+import polars as pl
 
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
@@ -153,9 +154,10 @@ class RLHFDataset(Dataset):
         dataframes = []
         for parquet_file in self.data_files:
             # read parquet files and cache
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            dataframe = pl.read_parquet(parquet_file)
             dataframes.append(dataframe)
-        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
+        # Convert Polars DataFrame to HuggingFace Dataset via Arrow (zero-copy)
+        self.dataframe: datasets.Dataset = datasets.Dataset(pl.concat(dataframes).to_arrow())
 
         total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")
@@ -441,6 +443,13 @@ class RLHFDataset(Dataset):
         # add index for each prompt
         if "extra_info" not in row_dict or row_dict["extra_info"] is None:
             row_dict["extra_info"] = dict()
+        # Handle extra_info as JSON string (for multi-agent support)
+        elif isinstance(row_dict["extra_info"], str):
+            import json
+            try:
+                row_dict["extra_info"] = json.loads(row_dict["extra_info"])
+            except json.JSONDecodeError:
+                row_dict["extra_info"] = dict()
         index = row_dict.get("extra_info", {}).get("index", 0)
         tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
         interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})

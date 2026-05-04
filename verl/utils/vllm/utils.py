@@ -74,7 +74,6 @@ class VLLMHijack:
                 hf_to_vllm_mapper = None
                 if hasattr(model, "hf_to_vllm_mapper") and model.hf_to_vllm_mapper is not None:
                     hf_to_vllm_mapper = model.hf_to_vllm_mapper
-
                 if isinstance(lora_request, TensorLoRARequest):
                     lora = self._lora_model_cls.from_lora_tensors(
                         lora_model_id=lora_request.lora_int_id,

@@ -269,13 +269,16 @@ class vLLMHttpServerBase:
 
         # update lora-related args
         if self.model_config.lora_rank > 0:
+            max_loras = self.config.max_loras
             args.update(
                 {
                     "enable_lora": True,
-                    "max_loras": 1,
+                    "max_loras": max_loras,
                     "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank),
                 }
             )
+            if self.replica_rank == 0:
+                logger.info(f"[Multi-Agent LoRA] Configured vLLM with max_loras={max_loras}")
 
         server_args = ["serve", self.model_config.local_path]
         for k, v in args.items():
@@ -376,6 +379,7 @@ class vLLMHttpServerBase:
         sampling_params: dict[str, Any],
         request_id: str,
         image_data: Optional[list[Any]] = None,
+        lora_int_id: Optional[int] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
@@ -391,11 +395,17 @@ class vLLMHttpServerBase:
         # Add lora request
         lora_request = None
         if self.model_config.lora_rank > 0:
+            if lora_int_id is None:
+                lora_int_id = VLLM_LORA_INT_ID
+                lora_name = VLLM_LORA_NAME
+            else:
+                lora_name = f"{lora_int_id}"
             # Make sure we also check that the lora is already loaded in the engine
-            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+            list_loras = await self.engine.list_loras()
+            lora_loaded = lora_int_id in list_loras
             if lora_loaded:
                 lora_request = LoRARequest(
-                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+                    lora_name=lora_name, lora_int_id=lora_int_id, lora_path=VLLM_LORA_PATH
                 )
 
         generator = self.engine.generate(
