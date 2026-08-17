@@ -700,3 +700,113 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
+
+    @GPUMemoryLogger(role="dp actor", logger=logger)
+    def compute_role_gradient(self, data: DataProto) -> dict:
+        """Accumulate the policy gradient for one role's sub-batch, without updating.
+
+        Measurement-only counterpart to `update_policy`, used by the per-role
+        gradient attribution probe (`rllm/trainer/verl/grad_probe.py`). Never called
+        during training. Leaves the result in `p.grad`; the caller harvests it.
+
+        Three deliberate differences from `update_policy`, each load-bearing:
+
+        1. **One accumulation, no mini-batch loop.** `update_policy` splits into
+           mini-batches and steps the optimizer once per mini-batch. Here the whole
+           sub-batch is accumulated in a single pass so `p.grad` is the gradient of
+           one well-defined objective.
+        2. **The per-sequence weight is uniform and shared across roles.** Under
+           `seq-mean-token-mean` with dynamic batching, a micro-batch contributes
+           `(1/B_micro)*sum_seq(token-mean loss) * (B_micro/W)` = `(1/W)*sum_seq`, so
+           every sequence carries weight `1/W` whatever its length or role. `W` is
+           `ppo_mini_batch_size`, matching training, which keeps probe gradient norms
+           commensurate with `actor/grad_norm`. Giving each role its own
+           normalization would rescale role r by `N/n_r` and divide out exactly the
+           slot-frequency channel the measurement exists to isolate.
+        3. **The optimizer is never stepped and never zeroed by anything else.**
+           `_optimizer_step` is not called, so no parameter, optimizer-state, or LR
+           schedule is touched.
+
+        With `ratio_mode="vanilla"` the importance ratio is forced to exactly 1, so
+        the measured object is the vanilla policy-gradient estimator `-E[A grad log pi]`.
+        That is the on-policy limit of what training computes here (`ppo_epochs=1`,
+        `entropy_coeff=0`, `use_kl_loss=false` on every probed run) and it is free of
+        the small recompute-vs-rollout log-prob discrepancy that would otherwise make
+        the ratio differ from 1 by a numerical accident. `ratio_mode="as_trained"`
+        keeps the stored `old_log_probs` instead.
+
+        Returns a dict of scalars describing the sub-batch (no gradient statistics;
+        those are computed by the worker, which owns the parameter shards).
+        """
+        self.actor_module.train()
+
+        ratio_mode = data.meta_info.get("grad_probe_ratio_mode", "vanilla")
+        temperature = data.meta_info["temperature"]
+
+        select_keys = [
+            "responses",
+            "response_mask",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "old_log_probs",
+            "advantages",
+        ]
+        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        if self.config.use_dynamic_bsz:
+            max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+            micro_batches, _ = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(self.config.ppo_micro_batch_size_per_gpu)
+
+        # Uniform per-sequence weight; see point 2 above.
+        weight_denominator = float(self.config.ppo_mini_batch_size)
+
+        self.actor_optimizer.zero_grad()
+
+        n_sequences = 0
+        n_response_tokens = 0
+        pg_loss_total = 0.0
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            response_mask = model_inputs["response_mask"]
+            advantages = model_inputs["advantages"]
+
+            loss_scale_factor = response_mask.shape[0] / weight_denominator
+
+            _, log_prob = self._forward_micro_batch(model_inputs, temperature=temperature, calculate_entropy=False)
+
+            if ratio_mode == "as_trained":
+                old_log_prob = model_inputs["old_log_probs"]
+            else:
+                old_log_prob = log_prob.detach()
+
+            policy_loss_fn = get_policy_loss_fn(self.config.policy_loss.get("loss_mode", "vanilla"))
+            pg_loss, _ = policy_loss_fn(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=advantages,
+                response_mask=response_mask,
+                loss_agg_mode=self.config.loss_agg_mode,
+                config=self.config,
+                rollout_is_weights=model_inputs.get("rollout_is_weights", None),
+            )
+
+            loss = pg_loss * loss_scale_factor
+            loss.backward()
+
+            n_sequences += int(response_mask.shape[0])
+            n_response_tokens += int(response_mask.sum().item())
+            pg_loss_total += float(pg_loss.detach().item()) * loss_scale_factor
+
+        return {
+            "n_sequences": n_sequences,
+            "n_response_tokens": n_response_tokens,
+            "pg_loss": pg_loss_total,
+            "weight_denominator": weight_denominator,
+            "ratio_mode": ratio_mode,
+        }

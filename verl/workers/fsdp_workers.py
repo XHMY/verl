@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import warnings
+from collections import OrderedDict
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -131,6 +132,32 @@ def get_vl_model_vision_tower(vl_model_instance):
         # transformers < 4.52.0
         return vl_model_instance.visual
     return None
+
+
+def _import_grad_probe_layout(module: str = "layout"):
+    """Import a helper module of the gradient-attribution probe ("layout"/"sketch").
+
+    Those helpers live in the repo's `analysis` package, which is deliberately not
+    pip-installed: it is offline analysis tooling, and the offline side must be
+    runnable without ray or a GPU. Ray workers therefore may not have the repo root
+    on `sys.path`. `rllm` is installed editable and sits directly under the repo
+    root, so it is a reliable anchor for finding it.
+
+    Only the probe code path calls this; nothing in training imports it.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(f"analysis.gradients.{module}")
+    except ImportError:
+        import sys
+
+        import rllm
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(rllm.__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        return importlib.import_module(f"analysis.gradients.{module}")
 
 
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -1231,6 +1258,276 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
         return output
+
+    # ------------------------------------------------------------------
+    # Per-role gradient attribution probe (measurement only).
+    #
+    # These three methods are never reached during training: the only caller is
+    # `rllm/trainer/verl/grad_probe.py`, which the trainer instantiates solely when
+    # `+trainer.grad_probe.enable=true` is passed on the command line. They read
+    # gradients and never write parameters, optimizer state, or the LR schedule.
+    # Spec: `papers_colm/rebuttal/gradient_attribution_experiment.md`.
+    # ------------------------------------------------------------------
+
+    def _probe_store(self):
+        if not hasattr(self, "_probe_grads"):
+            self._probe_grads = {}
+            self._probe_meta = {}
+            self._probe_sketches = {}
+            self._probe_sketcher = None
+        return self._probe_grads
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="purple", role="grad_probe")
+    def probe_role_gradients(self, data: DataProto):
+        """Backward one role's sub-batch and cache the resulting gradient shards.
+
+        The caller has already selected the adapter for this role under
+        isolated-policy routing (via `set_active_lora`, exactly as training does), so
+        `requires_grad` already scopes the parameter set correctly.
+
+        Gradient shards are kept on CPU: at 4B a single role's shard is ~0.5 GB per
+        rank, and vLLM holds most of the GPU. Statistics are taken over the shards in
+        `probe_reduce`, so nothing is gathered here.
+
+        `probe_sketch` switches to the per-copy path (S2a): instead of caching the
+        shards, the gradient is projected to a fixed-dimension CountSketch and
+        returned. That path runs once per (problem, slot) group, of which there are
+        ~192 per measurement point, far too many to keep in full precision.
+        """
+        assert self._is_actor
+        grad_layout = _import_grad_probe_layout()
+
+        role = data.meta_info["probe_role"]
+        adapter = data.meta_info.get("probe_adapter")
+        store_device = data.meta_info.get("probe_store_device", "cpu")
+        sketch_cfg = data.meta_info.get("probe_sketch")
+        cache_shards = data.meta_info.get("probe_cache", True)
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            info = self.actor.compute_role_gradient(data=data)
+
+            device = get_device_id()
+            shards = OrderedDict()
+            for key, _, param in grad_layout.trainable_lora_params(self.actor_module_fsdp, adapter=adapter):
+                if param.grad is None:
+                    continue
+                grad = param.grad
+                if isinstance(grad, DTensor):
+                    grad = grad.to_local()
+                shards[key] = grad.detach().to(
+                    device=store_device if cache_shards else device, dtype=torch.float32, copy=True
+                )
+
+            # Isolated-policy routing check. The whole per-role decomposition under
+            # isolated policy rests on this role's backward touching only this role's
+            # adapter, which `set_active_lora` is supposed to arrange by flipping
+            # `requires_grad`. If that call ever silently no-ops, gradients would keep
+            # accumulating on whichever adapter was active before and the roles would
+            # be quietly swapped. Reading the other adapters' `.grad` is a direct test
+            # of the thing itself rather than of the mechanism meant to produce it.
+            foreign = torch.zeros((), dtype=torch.float64, device=device)
+            if adapter is not None:
+                for name, param in self.actor_module_fsdp.named_parameters():
+                    owner = grad_layout.adapter_of(name)
+                    if owner is None or owner == adapter or param.grad is None:
+                        continue
+                    other = param.grad
+                    if isinstance(other, DTensor):
+                        other = other.to_local()
+                    if other.numel():
+                        foreign = torch.maximum(foreign, other.detach().abs().max().double().to(device))
+
+            # All-reduce every scalar so each rank returns the same global numbers.
+            # `DataProto.concat` asserts that non-metric meta_info agrees across
+            # ranks, and the reported quantities describe the whole role sub-batch
+            # rather than one rank's share of it.
+            totals = torch.tensor(
+                [float(info["n_sequences"]), float(info["n_response_tokens"]), float(info["pg_loss"])],
+                dtype=torch.float64,
+                device=device,
+            )
+            local_sq = torch.zeros((), dtype=torch.float64, device=device)
+            for tensor in shards.values():
+                local_sq += tensor.to(device).double().pow(2).sum()
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                torch.distributed.all_reduce(local_sq, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(foreign, op=torch.distributed.ReduceOp.MAX)
+
+            if sketch_cfg is not None:
+                sketch_mod = _import_grad_probe_layout("sketch")
+                if getattr(self, "_probe_sketcher", None) is None or self._probe_sketcher.dim != int(
+                    sketch_cfg["dim"]
+                ):
+                    self._probe_sketcher = sketch_mod.CountSketch(
+                        dim=int(sketch_cfg["dim"]), seed=int(sketch_cfg.get("seed", 0)), device=device
+                    )
+                vector = self._probe_sketcher.project({k: v.to(device) for k, v in shards.items()})
+                if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                    torch.distributed.all_reduce(vector, op=torch.distributed.ReduceOp.SUM)
+                # Held on the worker rather than returned: `probe_reduce` hands the
+                # whole set back in one call, which keeps 16k-float payloads out of
+                # the per-call cross-rank meta_info equality check.
+                self._probe_store()
+                self._probe_sketches[role] = vector.cpu().tolist()
+
+            if cache_shards:
+                # Stored as one contiguous vector plus the block boundaries, so a
+                # cross-role inner product is a single dot rather than one per
+                # parameter block (there are ~400 of them), and the canonical global
+                # layout can still be rebuilt block by block for persistence.
+                self._probe_store()[role] = {
+                    "keys": list(shards.keys()),
+                    "sizes": [int(t.numel()) for t in shards.values()],
+                    "flat": torch.cat([t.reshape(-1) for t in shards.values()])
+                    if shards
+                    else torch.zeros(0, dtype=torch.float32),
+                }
+                self._probe_meta[role] = {**info, "adapter": adapter, "n_param_blocks": len(shards)}
+
+            # Leave no gradient behind: the next role must start from zero, and
+            # nothing downstream should ever see a probe gradient.
+            self.actor_optimizer.zero_grad(set_to_none=True)
+
+            metrics = {
+                "role": role,
+                "adapter": adapter,
+                "weight_denominator": info["weight_denominator"],
+                "ratio_mode": info["ratio_mode"],
+                "n_sequences": int(totals[0].item()),
+                "n_response_tokens": int(totals[1].item()),
+                "pg_loss": float(totals[2].item()),
+                "grad_norm": float(local_sq.sqrt().item()),
+                "n_param_blocks": len(shards),
+                "foreign_grad_max": float(foreign.item()),
+            }
+            output = DataProto(meta_info={"probe": metrics})
+            output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def probe_reduce(self, roles: list = None, persist: dict = None, gram: bool = True):
+        """Turn the cached per-role gradient shards into statistics and artifacts.
+
+        The Gram matrix `M[r][r'] = <g_r, g_r'>` is assembled from local shard dot
+        products plus one all-reduce, which is exact and requires no gathering. Every
+        S1 quantity follows from it:
+            ||g_r||^2 = M[r][r],  ||g||^2 = sum_{r,r'} M[r][r'],  <g_r, g> = sum_r' M[r][r']
+
+        `gram=False` is used under isolated-policy routing, where each role owns a
+        separate adapter, so cross-role entries would be inner products between
+        different coordinate systems rather than a meaningful conflict measurement.
+
+        When `persist` is given, the full global gradient vector per role is written
+        to disk in the canonical layout so cross-step and displacement statistics can
+        be computed offline in exact arithmetic.
+        """
+        assert self._is_actor
+        grad_layout = _import_grad_probe_layout()
+
+        store = self._probe_store()
+        roles = [r for r in (roles or list(store.keys())) if r in store]
+        device = get_device_id()
+
+        multi_rank = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+
+        def _dot(vec_a, vec_b):
+            acc = torch.dot(vec_a.to(device).double(), vec_b.to(device).double())
+            if multi_rank:
+                torch.distributed.all_reduce(acc, op=torch.distributed.ReduceOp.SUM)
+            return float(acc.item())
+
+        gram_matrix = {}
+        if gram and roles:
+            keys = store[roles[0]]["keys"]
+            for role_a in roles:
+                gram_matrix[role_a] = {}
+            for i, role_a in enumerate(roles):
+                for role_b in roles[i:]:
+                    if store[role_b]["keys"] != keys:
+                        # Different coordinate systems; an inner product between them
+                        # would not mean anything.
+                        if self.rank == 0:
+                            missing = set(keys) ^ set(store[role_b]["keys"])
+                            print(
+                                f"[grad_probe] WARNING: '{role_b}' has {len(store[role_b]['keys'])} "
+                                f"parameter blocks vs {len(keys)} for '{roles[0]}'; "
+                                f"{len(missing)} keys differ, e.g. {sorted(missing)[:3]}",
+                                flush=True,
+                            )
+                        gram_matrix[role_a][role_b] = float("nan")
+                        gram_matrix[role_b][role_a] = float("nan")
+                        continue
+                    value = _dot(store[role_a]["flat"], store[role_b]["flat"])
+                    gram_matrix[role_a][role_b] = value
+                    gram_matrix[role_b][role_a] = value
+        elif roles:
+            for role in roles:
+                flat = store[role]["flat"]
+                gram_matrix[role] = {role: _dot(flat, flat)}
+
+        written = {}
+        if persist:
+            out_dir = persist["dir"]
+            dtype = torch.float16 if persist.get("dtype", "fp16") == "fp16" else torch.float32
+            persist_roles = [r for r in (persist.get("roles") or roles) if r in store]
+            if self.rank == 0:
+                os.makedirs(out_dir, exist_ok=True)
+            for role in persist_roles:
+                entry = store[role]
+                blocks = torch.split(entry["flat"].to(device), entry["sizes"])
+                chunks = [grad_layout.gather_global(block) for block in blocks]
+                if self.rank == 0 and chunks:
+                    vector = torch.cat(chunks).to(dtype).cpu().numpy()
+                    path = os.path.join(out_dir, f"{persist['tag']}_{role}.npy")
+                    np.save(path, vector)
+                    written[role] = path
+
+            if persist.get("theta"):
+                # The parameters themselves, in the same canonical layout as the
+                # gradients. This is what makes the displacement statistic offline and
+                # exact: the realized change over a window is the difference of two
+                # persisted theta vectors, with no safetensors parsing, no parameter-name
+                # mapping, and no risk that the two sides use different orderings.
+                theta = grad_layout.flat_vector(
+                    self.actor_module_fsdp, attr="data", adapter=persist.get("adapter")
+                )
+                if self.rank == 0 and theta.numel():
+                    path = os.path.join(out_dir, f"{persist['theta']}_theta.npy")
+                    np.save(path, theta.to(dtype).cpu().numpy())
+                    written["__theta__"] = path
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+        meta = dict(self._probe_meta)
+        sketches = dict(self._probe_sketches)
+        store.clear()
+        self._probe_meta = {}
+        self._probe_sketches = {}
+        return {"gram": gram_matrix, "meta": meta, "written": written, "sketches": sketches}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def probe_verify_layout(self, adapter_dir: str, adapter: str = None):
+        """Prove the shard->global reconstruction against the adapter on disk.
+
+        Runs at probe start. A pass means the canonical layout, the parameter-name
+        mapping, and the rank ordering are all correct, and therefore that gradient
+        vectors persisted by different jobs share one coordinate system. Without it
+        the cross-step cosines would be silently meaningless if FSDP internals or the
+        wrap policy ever changed.
+        """
+        assert self._is_actor
+        grad_layout = _import_grad_probe_layout()
+
+        return grad_layout.verify_layout(self.actor_module_fsdp, adapter_dir, adapter=adapter)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
