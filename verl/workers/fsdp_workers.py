@@ -705,6 +705,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # used for LoRA
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
         self.layered_summon = self.config.rollout.get("layered_summon", False)
+        # set by the weight-sync paths once the adapter(s) are registered in the rollout engine
+        self.rollout_lora_registered: bool = False
+        self.rollout_lora_int_ids: list[int] = []
 
         # 5. switch to trainer mode
         # NOTE: It's critical that hybrid engine in trainer mode initially to load checkpoint.
@@ -746,38 +749,41 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         get_torch_device().set_rng_state(self.gen_random_states)
 
     async def _sync_single_agent_weights(self, peft_model):
-        """Original single-agent weight sync logic (backward compatible)."""
+        """Sync actor weights to the rollout engine: no LoRA, or the single "default" adapter.
+
+        With LoRA the adapter is collected and registered under VLLM_LORA_INT_ID on every
+        sync, including the first, so the first rollout after loading ``lora_adapter_path``
+        is served by base+adapter rather than by the base model. Base weights are pushed on
+        the first sync (``load_format`` is dummy) and, with sleep_level == 2, on every sync
+        because vLLM discards them on sleep.
+        """
         peft_config = None
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.config.rollout.get("layered_summon", False),
-                base_sync_done=self.base_sync_done,
-            )
-            if not self.base_sync_done:
-                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+
+        need_base_sync = False
+        if peft_config is None:
+            params = convert_weight_keys(self.actor_module_fsdp.state_dict(), peft_model)
         else:
-            params = self.actor_module_fsdp.state_dict()
-
-        params = convert_weight_keys(
-            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        )
-
-        # Special handling for LoRA with sleep_level=2:
-        # When sleep_level=2, base model weights are destroyed during each sleep cycle.
-        # separately collect and update LoRA weights and base model weights through their respective interfaces.
-        # Here: params contains LoRA weights, base_model_params contains base model weights.
-        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
-            base_model_params = collect_lora_params(
+            layered_summon = self.config.rollout.get("layered_summon", False)
+            # Collect the adapter first, while the model is on GPU (same order as the multi-agent path).
+            adapter_params = collect_lora_params(
                 module=self.actor_module_fsdp,
-                layered_summon=self.layered_summon,
-                base_sync_done=False,
+                layered_summon=layered_summon,
+                base_sync_done=True,
+                adapter_name="default",
             )
-            base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
-            base_model_params = convert_weight_keys(
-                base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-            )
+            adapter_params = convert_weight_keys(adapter_params, peft_model)
+
+            need_base_sync = not self.base_sync_done or getattr(self.rollout, "sleep_level", None) == 2
+            if need_base_sync:
+                base_model_params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=layered_summon,
+                    base_sync_done=False,
+                )
+                base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
+                base_model_params = convert_weight_keys(base_model_params, peft_model)
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
         if self._is_offload_param:
@@ -786,30 +792,41 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         set_expandable_segments(False)
 
-        if peft_config is not None and self.base_sync_done:
-            per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
-        else:
-            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            per_tensor_param = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in params.items()
-            )
-
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
 
-        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
-            per_tensor_base_params = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in base_model_params.items()
-            )
-            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
-            del base_model_params, per_tensor_base_params
+        device = get_device_id()  # used when fsdp2 set cpu_offload_policy
 
-        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+        if peft_config is None:
+            per_tensor_param = (
+                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                for name, param in params.items()
+            )
+            await self.rollout.update_weights(per_tensor_param, peft_config=None, base_sync_done=self.base_sync_done)
+            del params, per_tensor_param
+        else:
+            if need_base_sync:
+                per_tensor_base_params = (
+                    (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                    for name, param in base_model_params.items()
+                )
+                await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
+                del base_model_params, per_tensor_base_params
+                aggressive_empty_cache(force_sync=False)
+
+            # vLLMAsyncRollout.update_weights calls dict()/len() on the LoRA payload: pass the sized view.
+            await self.rollout.update_weights(
+                adapter_params.items(),
+                peft_config=peft_config,
+                base_sync_done=True,
+                lora_int_id=VLLM_LORA_INT_ID,
+            )
+            self.rollout_lora_int_ids = [VLLM_LORA_INT_ID]
+            self.rollout_lora_registered = True
+            del adapter_params
+
         log_gpu_memory_usage("After update_weights", logger=logger)
-        del params, per_tensor_param
         aggressive_empty_cache(force_sync=True)
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
@@ -974,6 +991,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             del adapter_params
             aggressive_empty_cache(force_sync=False)
+
+        self.rollout_lora_int_ids = [idx + VLLM_LORA_INT_ID for idx in range(len(agent_names))]
+        self.rollout_lora_registered = True
 
         del all_adapter_params
         log_gpu_memory_usage("After update_weights (multi-agent)", logger=logger)
@@ -1528,6 +1548,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         grad_layout = _import_grad_probe_layout()
 
         return grad_layout.verify_layout(self.actor_module_fsdp, adapter_dir, adapter=adapter)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def probe_rollout_lora_state(self) -> dict:
+        """Rollout LoRA registration state for this rank (the worker group returns one dict per rank)."""
+        return {
+            "rank": self.rank,
+            "base_sync_done": bool(getattr(self, "base_sync_done", False)),
+            "rollout_lora_registered": bool(getattr(self, "rollout_lora_registered", False)),
+            "lora_int_ids": list(getattr(self, "rollout_lora_int_ids", [])),
+        }
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")

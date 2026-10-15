@@ -561,6 +561,7 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
+        optim_calls = 0
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -698,8 +699,36 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+                optim_calls += 1
         self.actor_optimizer.zero_grad()
+        # Optimizer-step bookkeeping (one scalar per call): number of mini-batches in this
+        # update, number of `_optimizer_step` calls made by it, and the AdamW per-parameter
+        # `state["step"]` of the first trainable parameter that has optimizer state.
+        append_to_dict(
+            metrics,
+            {
+                "actor/num_mini_batches": len(mini_batches),
+                "actor/optim_steps_this_call": optim_calls,
+                "actor/optim_step_count": self._optim_state_step(),
+            },
+        )
         return metrics
+
+    def _optim_state_step(self) -> float:
+        """AdamW `state["step"]` of the first trainable parameter with optimizer state (0 if none)."""
+        fallback = None
+        for group in self.actor_optimizer.param_groups:
+            for p in group["params"]:
+                state = self.actor_optimizer.state.get(p, None)
+                if not state or "step" not in state:
+                    continue
+                step = state["step"]
+                step = float(step.item()) if torch.is_tensor(step) else float(step)
+                if p.requires_grad:
+                    return step
+                if fallback is None:
+                    fallback = step
+        return fallback if fallback is not None else 0.0
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_role_gradient(self, data: DataProto) -> dict:
